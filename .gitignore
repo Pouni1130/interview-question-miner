@@ -1,0 +1,11 @@
+# 隐私与本地数据,永不入库
+config.yaml
+raw/
+data/
+logs/
+output/
+corpus_cache/
+_reference/
+__pycache__/
+*.pyc
+.venv/

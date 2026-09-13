@@ -1,0 +1,11 @@
+# {{ title }}
+
+> 生成时间:{{ generated_at }}
+> 排序:出现次数(不同帖子数) × 近期权重;≥3 个不同帖子出现的题目视为高频题
+> {{ disclaimer }}
+
+| # | 题目 | 类型 | 方向 | 公司 | 出现次数 | 最近出现 | 原帖 |
+|---|---|---|---|---|---|---|---|
+{% for item in items %}
+| {{ loop.index }} | {{ item.question }} | {{ item.q_type or '-' }} | {{ item.position_category }} | {{ item.company }} | {{ item.times_seen }} | {{ item.last_seen }} | [链接]({{ item.source_url }}) |
+{% endfor %}

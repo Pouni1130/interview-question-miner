@@ -1,0 +1,16 @@
+# {{ title }}
+
+> 生成时间:{{ generated_at }}
+> 本月题目条目:{{ count }} 条 | 覆盖公司:{{ companies | join('、') }}
+> {{ disclaimer }}
+
+{% for group in groups %}
+## {{ group.company }}
+
+{% for round in group.rounds %}
+### {{ round.round_name }}
+
+{{ round.block }}
+
+{% endfor %}
+{% endfor %}

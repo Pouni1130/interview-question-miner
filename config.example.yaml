@@ -1,0 +1,72 @@
+# 面经流水线全局配置 —— 所有可变项集中在此,代码中不硬编码
+
+collect:
+  # 牛客搜索关键词(每词一次搜索,按发布时间增量)
+  keywords:
+    - "Java后端 面经"
+    - "Java 一面"
+    - "Agent 开发 面经"
+    - "AI应用 面经"
+    - "大模型应用 面试"
+  # 请求间隔(秒),遵守低频采集纪律
+  request_interval: 5
+  # 每日采集帖数上限
+  daily_limit: 200
+  # 每个关键词最多解析的搜索结果页数
+  max_pages_per_keyword: 2
+  # 失败重试次数(指数退避)
+  max_retries: 3
+  # 可选:登录后 cookie(仅用于访问登录后可见的公开内容;留空则只抓匿名可见内容)
+  cookie: ""
+
+filter:
+  # 必须同时命中两组词才进入 LLM(命中"面试场景"词 且 命中"岗位相关"词)
+  interview_words:
+    - 面经
+    - 面试
+    - 一面
+    - 二面
+    - 三面
+    - hr面
+    - HR面
+    - 凉经
+    - offer
+  position_words:
+    - Java
+    - java
+    - JVM
+    - Spring
+    - MySQL
+    - Redis
+    - Kafka
+    - MQ
+    - 微服务
+    - 并发
+    - Agent
+    - agent
+    - LLM
+    - 大模型
+    - RAG
+    - Function Call
+    - Prompt
+    - 微调
+    - AI应用
+    - 后端
+
+llm:
+  # OpenAI 兼容协议(DeepSeek/GLM 等);key 留空则跳过抽取并提示
+  base_url: "https://api.deepseek.com/v1"
+  api_key: ""
+  model: "deepseek-chat"
+  # 每日 Token 预算,超限暂停抽取
+  daily_token_budget: 500000
+  # 超过此字符数的帖子分块抽取(控制单次 LLM 输出规模,防截断)
+  chunk_chars: 3000
+
+output:
+  raw_dir: "raw"
+  db_path: "data/interviews.db"
+  output_dir: "output"
+  pending_dir: "output/pending"
+  template_dir: "templates"
+  log_dir: "logs"
