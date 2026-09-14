@@ -1,11 +1,16 @@
 # {{ title }}
 
-> 生成时间:{{ generated_at }}
-> 排序:出现次数(不同帖子数) × 近期权重;≥3 个不同帖子出现的题目视为高频题
+> 生成时间：{{ generated_at }}
+> 仅收录时间窗内至少 {{ min_posts }} 个不同原帖出现的题目；每个原帖仅计一次。
+> 排序分数 = Σ 2^(-距今天数 / {{ half_life }})。日期取明确面试日期，否则取发布日期。
 > {{ disclaimer }}
 
-| # | 题目 | 类型 | 方向 | 公司 | 出现次数 | 最近出现 | 原帖 |
+{% if items %}
+| # | 题目 | 类型 | 方向 | 公司 | 不同帖子数 | 最近出现 | 原帖 |
 |---|---|---|---|---|---|---|---|
-{% for item in items %}
-| {{ loop.index }} | {{ item.question }} | {{ item.q_type or '-' }} | {{ item.position_category }} | {{ item.company }} | {{ item.times_seen }} | {{ item.last_seen }} | [链接]({{ item.source_url }}) |
+{% for item in items -%}
+| {{ loop.index }} | {{ item.question | md }} | {{ item.q_type | md }} | {{ item.position_category | md }} | {{ item.companies | md }} | {{ item.times_seen }} | {{ item.last_seen }} | {% for source in item.sources %}[来源{{ loop.index }}]({{ source.url }}) {% endfor %} |
 {% endfor %}
+{% else %}
+暂无满足高频条件的题目。不会以只出现一次的题目填满榜单。
+{% endif %}

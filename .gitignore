@@ -9,3 +9,8 @@ _reference/
 __pycache__/
 *.pyc
 .venv/
+cookies.json
+.env
+.pytest_cache/
+.audit-live/
+.pytest_tmp/

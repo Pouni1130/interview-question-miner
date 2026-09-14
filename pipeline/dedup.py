@@ -5,37 +5,22 @@ import hashlib
 import re
 import unicodedata
 
-# 同义归并词表:标准化前替换(维护在代码内,规模小、变更少)
-SYNONYMS = {
-    "中间件": "",
-    "请问": "",
-    "问一下": "",
-    "面试官问": "",
-    "面试官让我": "",
-    "讲一下": "",
-    "说说": "",
-    "介绍一下": "",
-    "如何理解": "如何",
-    "你怎么理解": "如何",
-    "你的理解": "如何",
-}
-
 _PUNCT_RE = re.compile(r"[^\w\u4e00-\u9fff]+")
 
 
-def normalize_question(text: str) -> str:
+def normalize_question(text: str, synonyms: dict[str, str] | None = None) -> str:
     """题目标准化:同义归并 → 全角转半角 → 去标点 → 转小写 → 去空白。"""
     t = text.strip()
-    for src, dst in SYNONYMS.items():
+    for src, dst in (synonyms if synonyms is not None else {}).items():
         t = t.replace(src, dst)
     t = unicodedata.normalize("NFKC", t)
     t = _PUNCT_RE.sub("", t)
     return t.lower().strip()
 
 
-def question_hash(text: str) -> str:
-    """标准化后的 md5,用于跨帖精确去重与高频统计。"""
-    return hashlib.md5(normalize_question(text).encode("utf-8")).hexdigest()
+def question_hash(text: str, synonyms: dict[str, str] | None = None) -> str:
+    """标准化后的 sha256,用于跨帖精确去重与高频统计。"""
+    return hashlib.sha256(normalize_question(text, synonyms).encode("utf-8")).hexdigest()
 
 
 def _char_shingles(text: str, k: int = 3) -> set[str]:
@@ -55,6 +40,7 @@ def is_duplicate(
     existing: list[tuple[str, str]],
     threshold: float = 0.9,
     short_len: int = 30,
+    synonyms: dict[str, str] | None = None,
 ) -> str | None:
     """判断新题(已标准化)是否与既有题目重复。
 
@@ -62,12 +48,12 @@ def is_duplicate(
     existing 为 [(hash, question_raw)] 列表。返回命中的 hash 或 None。
     """
     for qhash, raw in existing:
-        norm = normalize_question(raw)
+        norm = normalize_question(raw, synonyms)
         if not norm or not normalized_new:
             continue
         # 完全一致(不限长度)或 短题高相似
         if norm == normalized_new:
             return qhash
-        if len(normalized_new) < short_len and jaccard_similarity(normalized_new, norm) > threshold:
+        if max(len(normalized_new), len(norm)) < short_len and jaccard_similarity(normalized_new, norm) > threshold:
             return qhash
     return None

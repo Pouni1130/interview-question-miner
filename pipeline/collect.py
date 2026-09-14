@@ -1,315 +1,274 @@
-"""采集层:牛客网公开面经搜索与详情抓取。
-
-2026-09 实测:牛客搜索页已改为 AJAX 动态加载(SSR 搜索页失效),
-改用其公开搜索接口 gw-c.nowcoder.com/api/sparta/pc/search:
-- contentType 250(POST,讨论区帖):搜索结果只给摘要,
-  详情走 https://www.nowcoder.com/discuss/{contentID}(SSR 全文,
-  选择器参考 InterviewRadar:div.nc-slate-editor-content + createTime 正则);
-- contentType 74(MOMENTS,动态帖):正文短,搜索结果即全文,直接入库。
-
-采集纪律:低频(request_interval 秒)、只抓公开页、绝不绕过登录/验证码、
-失败指数退避重试最多 max_retries 次。原始数据一经落盘永不修改。
-"""
+"""Public HTML/RSS/sitemap collection; Nowcoder first, CSDN and Juejin supplemental."""
 from __future__ import annotations
-
+import hashlib
+import json
 import logging
 import re
-import time
-from datetime import datetime
-from html import unescape
+from dataclasses import dataclass, asdict
+from datetime import datetime, timedelta
 from pathlib import Path
-
-import requests
+from urllib.parse import urljoin, urlsplit, urlunsplit
 from bs4 import BeautifulSoup
-
 from .config import AppConfig
+from .http import PublicHTTP, SkipPage, SourceUnavailable
+from .runtime import now, LOCAL_TZ, iso_date
 
 logger = logging.getLogger(__name__)
+ARTICLE_PATTERNS = {
+    "nowcoder": re.compile(r"^/(?:discuss/\d+|feed/main/detail/[\w-]+)$"),
+    "csdn": re.compile(r"^/[^/]+/article/details/\d+$"),
+    "juejin": re.compile(r"^/post/\d+$"),
+}
+CONTENT_SELECTORS = {
+    "nowcoder": ["div.nc-slate-editor-content", ".post-topic-des", ".feed-content-text"],
+    "csdn": ["#content_views"],
+    "juejin": [".article-content", ".markdown-body"],
+}
 
-NOWCODER_BASE = "https://www.nowcoder.com"
-SEARCH_API = "https://gw-c.nowcoder.com/api/sparta/pc/search"
-CREATE_TIME_RE = re.compile(r'"createTime"\s*:\s*(\d{10,13})')
-UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
-)
-
-
-def post_id_from_url(url: str) -> str:
-    """从 /discuss/123 或 /feed/main/detail/xxx 提取帖子唯一 ID。"""
-    m = re.search(r"/discuss/(\d+)", url) or re.search(r"/feed/main/detail/([\w-]+)", url)
-    return m.group(1) if m else re.sub(r"\W+", "_", url)[-40:]
-
-
-def _ms_to_iso(ms: int | None) -> str | None:
-    if not ms:
-        return None
-    try:
-        return datetime.fromtimestamp(ms / 1000).isoformat(timespec="seconds")
-    except (ValueError, OSError):
-        return None
-
-
-class NowcoderCollector:
-    """牛客采集器:搜索接口发现 + 详情抓取,带限频与退避重试。"""
-
-    def __init__(self, cfg: AppConfig):
-        self.cfg = cfg.collect
-        self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "User-Agent": UA,
-                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
-            }
-        )
-        if self.cfg.cookie:
-            self.session.headers["Cookie"] = self.cfg.cookie
-
-    # ---------- HTTP 基础 ----------
-
-    def _sleep(self) -> None:
-        time.sleep(self.cfg.request_interval)
-
-    def _get(self, url: str) -> str:
-        """带限频与指数退避的 GET(HTML 页)。"""
-        last_exc: Exception | None = None
-        for attempt in range(self.cfg.max_retries + 1):
-            self._sleep()
-            try:
-                resp = self.session.get(url, timeout=20)
-                if resp.status_code in (403, 412, 429):
-                    wait = 2**attempt * 30
-                    logger.warning("HTTP %s 于 %s,退避 %ss", resp.status_code, url, wait)
-                    time.sleep(wait)
-                    continue
-                resp.raise_for_status()
-                return resp.text
-            except requests.RequestException as exc:
-                last_exc = exc
-                wait = 2**attempt * 5
-                logger.warning("请求失败(%s/%s): %s,退避 %ss", attempt + 1, self.cfg.max_retries, exc, wait)
-                time.sleep(wait)
-        raise ConnectionError(f"重试耗尽: {url}") from last_exc
-
-    # ---------- 搜索(公开 AJAX 接口) ----------
-
-    def search_posts(self, keyword: str, max_pages: int) -> list[dict]:
-        """搜索一个关键词,返回候选列表:
-        [{url, post_id, kind('post'|'moment'), title, snippet, author, publish_time}]
-
-        接口单词 total 上限 400,分页大小 20。
-        """
-        candidates: list[dict] = []
-        seen: set[str] = set()
-        for page in range(1, max_pages + 1):
-            body = {
-                "query": keyword,
-                "type": "post",
-                "page": page,
-                "tag": [],
-                "order": "",
-                "pageSize": 20,
-            }
-            try:
-                self._sleep()
-                resp = self.session.post(SEARCH_API, json=body, timeout=20)
-                resp.raise_for_status()
-                payload = resp.json()
-            except (requests.RequestException, ValueError) as exc:
-                logger.error("搜索接口失败[%s 第%d页]: %s", keyword, page, exc)
-                break
-            if not payload.get("success"):
-                logger.error("搜索接口返回失败[%s 第%d页]: %s", keyword, page, payload.get("msg"))
-                break
-            data = payload.get("data") or {}
-            records = data.get("records") or []
-            for rec in records:
-                cand = _parse_search_record(rec)
-                if cand and cand["url"] not in seen:
-                    seen.add(cand["url"])
-                    candidates.append(cand)
-            if page >= (data.get("totalPage") or 1):
-                break
-        return candidates
-
-    # ---------- 详情 ----------
-
-    def fetch_post_full(self, cand: dict) -> str | None:
-        """抓取帖子全文:POST 类型抓 discuss SSR 页;MOMENTS 直接用摘要。"""
-        if cand["kind"] == "moment":
-            return cand["snippet"]
-        try:
-            html = self._get(cand["url"])
-        except ConnectionError as exc:
-            logger.error("跳过不可达帖子 %s: %s", cand["url"], exc)
-            return None
-        soup = BeautifulSoup(html, "lxml")
-        content_el = soup.select_one("div.nc-slate-editor-content") or soup.select_one(
-            ".post-topic-des"
-        )
-        content = content_el.get_text("\n", strip=True) if content_el else ""
-        if not content:
-            logger.warning("正文解析为空(选择器可能漂移): %s", cand["url"])
-            return cand["snippet"] or None
-        return content
-
-
-def _parse_search_record(rec: dict) -> dict | None:
-    """把搜索接口的一条记录解析为候选 dict;解析不出 URL 时返回 None。"""
-    extra = rec.get("extraInfo") or {}
-    kind = extra.get("contentType_var")
-    content_data = rec.get("contentData") or {}
-    moment_data = rec.get("momentData") or {}
-    if kind == "POST" and content_data:
-        content_id = extra.get("contentID_var") or str(content_data.get("id") or "")
-        if not content_id.isdigit():
-            return None
-        url = f"{NOWCODER_BASE}/discuss/{content_id}"
-        title = content_data.get("title") or ""
-        snippet = content_data.get("content") or ""
-        author = (rec.get("userBrief") or {}).get("nickname") or ""
-        publish_time = _ms_to_iso(content_data.get("createTime"))
-        return {
-            "url": url,
-            "post_id": content_id,
-            "kind": "post",
-            "title": _clean(title),
-            "snippet": snippet,
-            "author": author,
-            "publish_time": publish_time,
-        }
-    if kind == "MOMENTS" and moment_data:
-        uuid = moment_data.get("uuid") or ""
-        if not uuid:
-            return None
-        url = f"{NOWCODER_BASE}/feed/main/detail/{uuid}"
-        return {
-            "url": url,
-            "post_id": uuid,
-            "kind": "moment",
-            "title": _clean(moment_data.get("title") or ""),
-            "snippet": moment_data.get("content") or "",
-            "author": (rec.get("userBrief") or {}).get("nickname") or "",
-            "publish_time": _ms_to_iso(moment_data.get("createdAt")),
-        }
-    return None
-
-
-def _clean(text: str) -> str:
-    return unescape(re.sub(r"\s+", " ", text or "")).strip()
-
-
-def _extract_publish_time(html: str) -> str | None:
-    """从 discuss 详情页内嵌 JS 提取 createTime(参考 InterviewRadar)。"""
-    m = CREATE_TIME_RE.search(html)
-    if not m:
-        return None
-    ts = int(m.group(1))
-    if ts > 10_000_000_000:
-        ts //= 1000
-    try:
-        return datetime.fromtimestamp(ts).isoformat(timespec="seconds")
-    except (ValueError, OSError):
-        return None
-
-
-# ---------- 落盘 ----------
-
-
-def save_raw(raw_dir: Path, post: "RawPost") -> Path:
-    """原始数据落地 raw/{source}/{yyyy-mm-dd}/{post_id}.json,永不覆盖已有文件。"""
-    import json
-
-    day = datetime.now().strftime("%Y-%m-%d")
-    out_dir = raw_dir / post.source / day
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out = out_dir / f"{post.post_id}.json"
-    if out.exists():
-        return out
-    out.write_text(json.dumps(post.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
-    return out
-
-
+@dataclass
 class RawPost:
-    """原始帖:落盘与入库的统一载体。"""
-
-    def __init__(self, url: str, post_id: str, title: str, author: str,
-                 publish_time: str | None, crawl_time: str, content_raw: str,
-                 source: str = "nowcoder"):
-        self.url = url
-        self.post_id = post_id
-        self.title = title
-        self.author = author
-        self.publish_time = publish_time
-        self.crawl_time = crawl_time
-        self.content_raw = content_raw
-        self.source = source
+    url: str
+    post_id: str
+    title: str
+    author: str
+    publish_time: str | None
+    crawl_time: str
+    content_raw: str
+    source: str = "nowcoder"
 
     def to_dict(self) -> dict:
-        return {
-            "url": self.url, "post_id": self.post_id, "title": self.title,
-            "author": self.author, "publish_time": self.publish_time,
-            "crawl_time": self.crawl_time, "content_raw": self.content_raw,
-            "source": self.source,
-        }
+        return asdict(self)
 
+def canonical_url(url: str) -> str:
+    p = urlsplit(url)
+    return urlunsplit((p.scheme,p.netloc,p.path.rstrip("/"),"",""))
 
-def collect_incremental(cfg: AppConfig) -> int:
-    """执行增量采集:搜索 → 过滤已见 → 抓全文 → 落盘入库。返回新增帖数。"""
-    from .store import Store
+def post_id_from_url(url: str) -> str:
+    return urlsplit(url).path.rstrip("/").rsplit("/",1)[-1]
 
-    store = Store(cfg.resolve(cfg.output.db_path))
-    collector = NowcoderCollector(cfg)
-    fetched = 0
+def save_raw(raw_dir: Path, post: RawPost) -> Path:
+    """Immutable snapshots; a different publication timestamp gets a suffix."""
+    from .store import fingerprint
+    day = iso_date(post.crawl_time) or now().date().isoformat()
+    path = raw_dir / post.source / day / f"{post.post_id}.json"
+    path.parent.mkdir(parents=True,exist_ok=True)
+    if path.exists():
+        old = json.loads(path.read_text(encoding="utf-8"))
+        if old.get("url") == post.url and old.get("publish_time") == post.publish_time:
+            return path
+        path = path.with_name(f"{post.post_id}-{fingerprint(post.url,post.publish_time or '')[:12]}.json")
+    if not path.exists():
+        # Complete temp write followed by rename; CLI holds the process lock.
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(post.to_dict(),ensure_ascii=False,indent=2),encoding="utf-8")
+        tmp.rename(path)
+    return path
 
-    for kw in cfg.collect.keywords:
-        if fetched >= cfg.collect.daily_limit:
-            logger.info("已达每日上限 %d,停止采集", cfg.collect.daily_limit)
-            break
-        cands = collector.search_posts(kw, cfg.collect.max_pages_per_keyword)
-        logger.info("关键词[%s] 发现 %d 条候选", kw, len(cands))
-        for cand in cands:
-            if fetched >= cfg.collect.daily_limit:
+def _published(soup: BeautifulSoup, html: str, source: str) -> str | None:
+    for selector in ('meta[property="article:published_time"]','meta[itemprop="datePublished"]','meta[name="publishdate"]','time[datetime]'):
+        tag = soup.select_one(selector)
+        if tag:
+            value = tag.get("content") or tag.get("datetime")
+            if iso_date(value):
+                return str(value)
+    # Explicit structured timestamps, not a sitemap's lastmod or crawl time.
+    patterns = [r'"datePublished"\s*:\s*"([^"\n]+)"']
+    if source == "nowcoder":
+        match = re.search(r'"createTime"\s*:\s*(\d{10,13})',html)
+        if match:
+            stamp = int(match.group(1))
+            if stamp > 10000000000:
+                stamp /= 1000
+            return datetime.fromtimestamp(stamp,LOCAL_TZ).isoformat(timespec="seconds")
+    for pattern in patterns:
+        match = re.search(pattern,html)
+        if match and iso_date(match.group(1)):
+            return match.group(1)
+    for selector in ([".time", ".blog-article-content .article-info-box .time"] if source == "csdn" else [".article-meta-box time", ".article-info .time"]):
+        tag = soup.select_one(selector)
+        match = re.search(r"(20\d{2})[年/-](\d{1,2})[月/-](\d{1,2})",tag.get_text() if tag else "")
+        if match:
+            value = f"{match[1]}-{int(match[2]):02d}-{int(match[3]):02d}"
+            if iso_date(value):
+                return value
+    return None
+
+def parse_article(url: str, html: str, source: str) -> RawPost:
+    """Read only rendered public article content, never hidden paid payloads."""
+    soup = BeautifulSoup(html,"lxml")
+    page_text = soup.get_text(" ",strip=True)
+    pay_markers = ("付费后可阅读", "付费解锁", "购买后阅读", "购买专栏解锁", "开通VIP后", "订阅后可阅读", "会员专享文章", "登录后继续阅读", "登录后查看全文", "登录后可查看", "扫码登录后", "VIP专享文章")
+    if any(marker.lower() in page_text.lower() for marker in pay_markers) or soup.select_one(".blog-tags-box .isblogvip, .hide-article-box, .article-paywall, [data-paywall='true']"):
+        raise SkipPage("付费/会员/登录限制，整篇跳过")
+    if re.search(r'"(?:is_pay|is_paid|isCharge|isVip|need_pay)"\s*:\s*(?:true|1)\b',html,re.I):
+        raise SkipPage("付费内容标记，整篇跳过")
+    content_el = next((soup.select_one(selector) for selector in CONTENT_SELECTORS[source] if soup.select_one(selector)),None)
+    if not content_el:
+        raise SkipPage("公开正文缺失；不以搜索摘要代替全文")
+    for tag in content_el.select("script,style,nav,.advertisement,.recommend-box"):
+        tag.decompose()
+    content = content_el.get_text("\n",strip=True)
+    if len(content) < 30:
+        raise SkipPage("正文过短或不完整")
+    h1 = soup.select_one("h1")
+    meta = soup.select_one('meta[property="og:title"]')
+    title = h1.get_text(" ",strip=True) if h1 else (meta.get("content","") if meta else "")
+    author_tag = soup.select_one('meta[name="author"]')
+    author = author_tag.get("content","") if author_tag else ""
+    if not author:
+        author_el = soup.select_one(".user-name, #uid, .author-name, .name")
+        author = author_el.get_text(" ",strip=True) if author_el else ""
+    published = _published(soup,html,source)
+    if not published:
+        raise SkipPage("缺少可靠发布日期；不能按采集时间假定为新帖")
+    return RawPost(canonical_url(url),post_id_from_url(url),title,author,published,now().isoformat(timespec="seconds"),content,source)
+
+class PublicCollector:
+    def __init__(self, cfg: AppConfig, source: str):
+        self.app = cfg
+        self.source = source
+        self.cfg = cfg.sources[source]
+        self.http = PublicHTTP(cfg.collect,self.cfg.hosts)
+
+    def discover(self) -> list[str]:
+        """Bounded discovery from allowed lists, RSS/Atom and sitemaps."""
+        candidates = list(self.cfg.seed_urls)
+        relevance = {}
+        queue = list(self.cfg.discovery_urls)
+        visited = set()
+        for _ in range(self.cfg.max_discovery_pages):
+            if not queue:
                 break
-            if store.has_post(cand["url"]):
+            url = queue.pop(0)
+            if url in visited:
                 continue
-            content = collector.fetch_post_full(cand)
-            if not content:
+            visited.add(url)
+            try:
+                response = self.http.get(url)
+            except SourceUnavailable:
+                raise
+            except SkipPage as exc:
+                logger.warning("[%s] 发现页跳过 %s: %s",self.source,url,exc)
                 continue
-            post = RawPost(
-                url=cand["url"],
-                post_id=cand["post_id"],
-                title=cand["title"],
-                author=cand["author"],
-                publish_time=cand["publish_time"],
-                crawl_time=datetime.now().isoformat(timespec="seconds"),
-                content_raw=f"{cand['title']}\n\n{content}" if content else cand["title"],
-            )
-            save_raw(cfg.resolve(cfg.output.raw_dir), post)
-            store.upsert_post(post, status="raw")
-            fetched += 1
-            logger.debug("已采集(%d): %s", fetched, post.title)
+            is_xml = response.text.lstrip().startswith("<?xml") or "xml" in response.headers.get("Content-Type", "")
+            soup = BeautifulSoup(response.text,"xml" if is_xml else "lxml")
+            links = []
+            if is_xml:
+                # Reversing URL entries prefers recent entries when sorted by ID;
+                # publication dates are always checked on the actual article.
+                for tag in soup.select("loc, item > link, entry > link"):
+                    links.append((tag.get("href") or tag.get_text(strip=True),""))
+            else:
+                for tag in soup.select("a[href]"):
+                    links.append((urljoin(url,tag["href"]),tag.get_text(" ",strip=True)))
+                if not any(ARTICLE_PATTERNS[self.source].match(urlsplit(link).path.rstrip("/")) for link,_ in links):
+                    logger.warning("[%s] 公开列表没有文章链接（可能仅为动态页面）；请配置允许的 RSS/站点地图或公开文章 seed_urls：%s",self.source,url)
+            for link,title in links:
+                p = urlsplit(link)
+                if p.hostname not in self.cfg.hosts or p.scheme != "https":
+                    continue
+                if p.path.endswith(".xml") and link not in visited:
+                    queue.append(link)
+                elif ARTICLE_PATTERNS[self.source].match(p.path.rstrip("/")):
+                    # Title gate before spending requests; unknown titles (RSS,
+                    # sitemap or seeds) go through the full-content coarse filter.
+                    if title and self.app.filter.interview_words and not any(w.lower() in title.lower() for w in self.app.filter.interview_words):
+                        continue
+                    candidates.append(canonical_url(link))
+                    normalized = title.lower()
+                    score = sum(w.lower() in normalized for w in self.app.filter.position_words)
+                    score += 2 * sum(w.lower() in normalized for w in self.app.collect.keywords)
+                    key = canonical_url(link)
+                    relevance[key] = max(relevance.get(key,0),score)
+        candidates = list(dict.fromkeys(candidates))
+        seeds = set(self.cfg.seed_urls)
+        candidates.sort(key=lambda u: (u in seeds,relevance.get(u,0),post_id_from_url(u)),reverse=True)
+        return candidates[:self.app.collect.max_candidates_per_source]
 
-    logger.info("本次采集完成:新增 %d 帖", fetched)
-    return fetched
+    def fetch(self, url: str) -> RawPost:
+        if not ARTICLE_PATTERNS[self.source].match(urlsplit(url).path.rstrip("/")):
+            raise SkipPage("不是该来源文章 URL")
+        response = self.http.get(url)
+        return parse_article(response.url or url,response.text,self.source)
 
+def recover_raw(cfg: AppConfig, store) -> int:
+    """Recover a complete immutable raw file written before a DB commit."""
+    recovered = 0
+    for path in cfg.resolve(cfg.output.raw_dir).glob("*/*/*.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            post = RawPost(**{k:data[k] for k in RawPost.__dataclass_fields__})
+            if post.source not in cfg.sources or not iso_date(post.publish_time):
+                continue
+            if not store.has_post(post.url,post.publish_time):
+                store.upsert_post(post,raw_path=path)
+                recovered += 1
+        except (ValueError,KeyError,TypeError,OSError):
+            logger.warning("跳过无效 raw 文件: %s",path.name)
+    return recovered
 
-def main(config_path: str | None = None) -> int:
-    """独立入口:python -m pipeline.collect [--config path]"""
-    import argparse
+def collect_incremental(cfg: AppConfig, days: int | None = None, sources: list[str] | None = None) -> int:
+    from .store import Store
+    days = days if days is not None else cfg.collect.days
+    if days <= 0:
+        raise ValueError("days 必须为正数")
+    since = now().date() - timedelta(days=days-1)
+    total = 0
+    with Store(cfg.resolve(cfg.output.db_path)) as store:
+        recover_raw(cfg,store)
+        for source in (sources or list(cfg.sources)):
+            if not cfg.sources[source].enabled:
+                continue
+            if source == "github":
+                from .github import GitHubCollector
+                collector = GitHubCollector(cfg,days)
+            else:
+                collector = PublicCollector(cfg,source)
+            try:
+                if store.collected_today() >= cfg.collect.daily_limit:
+                    break
+                if store.collected_today(source) >= cfg.sources[source].max_posts:
+                    continue
+                for url in collector.discover():
+                    if store.collected_today() >= cfg.collect.daily_limit or store.collected_today(source) >= cfg.sources[source].max_posts:
+                        break
+                    if store.attempted_today(url):
+                        continue
+                    try:
+                        post = collector.fetch(url)
+                        day = datetime.fromisoformat(post.publish_time.replace("Z","+00:00")).date()
+                        if not since <= day <= now().date():
+                            store.record_fetch(url,source,"skipped","outside_time_window")
+                            continue
+                        if store.has_post(post.url,post.publish_time):
+                            store.record_fetch(url,source,"seen")
+                            continue
+                        path = save_raw(cfg.resolve(cfg.output.raw_dir),post)
+                        store.upsert_post(post,raw_path=path)
+                        store.record_fetch(url,source,"collected")
+                        total += 1
+                        logger.info("[%s] 已采集 %s",source,post.title)
+                    except SourceUnavailable as exc:
+                        store.record_fetch(url,source,"source_unavailable",str(exc))
+                        raise
+                    except (SkipPage,ValueError) as exc:
+                        store.record_fetch(url,source,"skipped",str(exc))
+                        logger.warning("[%s] 跳过 %s: %s",source,url,exc)
+            except (SourceUnavailable,SkipPage) as exc:
+                logger.warning("[%s] 本次暂停: %s",source,exc)
+                store.record_fetch(f"source:{source}",source,"source_unavailable",str(exc))
+            except Exception as exc:
+                logger.error("[%s] 来源失败，不影响其他来源: %s",source,type(exc).__name__)
+                store.record_fetch(f"source:{source}",source,"failed",type(exc).__name__)
+            finally:
+                collector.http.close()
+    logger.info("采集完成: 新增 %d 帖",total)
+    return total
 
-    from .config import load_config, setup_logging
-
-    parser = argparse.ArgumentParser(description="牛客面经增量采集")
-    parser.add_argument("--config", default=None)
-    parser.add_argument("--verbose", action="store_true")
-    args = parser.parse_args()
-
-    cfg = load_config(config_path or args.config)
-    setup_logging(cfg.resolve(cfg.output.log_dir), args.verbose)
-    collect_incremental(cfg)
-    return 0
-
+def main() -> int:
+    import sys
+    from .__main__ import main as cli
+    return cli(["collect",*sys.argv[1:]])
 
 if __name__ == "__main__":
     raise SystemExit(main())

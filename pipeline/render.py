@@ -1,188 +1,100 @@
-"""渲染输出层:SQLite 结构化数据 → Markdown 专题文件(Jinja2 模板)。"""
+"""Evidence-preserving monthly Markdown and distinct-post recency ranking."""
 from __future__ import annotations
-
 import json
-import logging
+import os
+import re
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import date, timedelta
 from pathlib import Path
-
-from jinja2 import Environment, FileSystemLoader
-
+from jinja2 import Environment, FileSystemLoader, StrictUndefined
 from .config import AppConfig
-from .store import Store
+from .runtime import now
 
-logger = logging.getLogger(__name__)
+CATEGORY_DIRS = {"java_backend":"Java后端","agent_ai":"Agent开发","other":"其他"}
+DISCLAIMER = "内容来源于网络公开面经，版权归原作者所有，仅供个人学习。"
 
-CATEGORY_DIRS = {
-    "java_backend": "Java后端",
-    "agent_ai": "Agent开发",
-    "other": "其他",
-}
-
-DISCLAIMER = "内容来源于网络公开面经,版权归原作者所有,仅供个人学习。"
-
-
-def _env(template_dir: Path) -> Environment:
-    return Environment(
-        loader=FileSystemLoader(str(template_dir)),
-        autoescape=False,
-        trim_blocks=False,
-        lstrip_blocks=False,
-    )
-
-
-def render_all(cfg: AppConfig, store: Store) -> list[Path]:
-    """生成/更新全部输出文件,返回写入路径列表。"""
-    out_root = cfg.resolve(cfg.output.output_dir)
-    env = _env(cfg.resolve(cfg.output.template_dir))
-    today = datetime.now()
-    month_start = today.strftime("%Y-%m-01")
-    written: list[Path] = []
-
-    # 月度面经汇总:按岗位分目录
-    for category, dirname in CATEGORY_DIRS.items():
-        rows = store.questions_for_render(category=category, since=month_start)
-        if not rows:
-            continue
-        groups = _group_company_round(rows)
-        companies = sorted({r["company"] or "未知公司" for r in rows})
-        ctx = {
-            "title": f"{dirname} 面经汇总({today.strftime('%Y-%m')})",
-            "generated_at": today.isoformat(timespec="seconds"),
-            "count": len(rows),
-            "companies": companies,
-            "groups": groups,
-            "disclaimer": DISCLAIMER,
-        }
-        out_dir = out_root / dirname
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out = out_dir / f"{today.strftime('%Y-%m')}.md"
-        out.write_text(env.get_template("monthly.md.j2").render(**ctx), encoding="utf-8")
-        written.append(out)
-
-    # 近 30 天高频题 Top50
-    since_30d = (today - timedelta(days=30)).strftime("%Y-%m-%d")
-    rows = store.questions_for_render(since=since_30d)
-    if rows:
-        ranked = sorted(
-            rows,
-            key=lambda r: (r["times_seen"], r["last_seen"]),
-            reverse=True,
-        )[:50]
-        ctx = {
-            "title": f"近30天高频题 Top{len(ranked)}",
-            "generated_at": today.isoformat(timespec="seconds"),
-            "items": [
-                {
-                    "question": r["question"],
-                    "q_type": r["q_type"],
-                    "times_seen": r["times_seen"],
-                    "company": r["company"] or "未知公司",
-                    "position_category": CATEGORY_DIRS.get(
-                        r["position_category"], "其他"
-                    ),
-                    "last_seen": (r["last_seen"] or "")[:10],
-                    "source_url": r["source_url"],
-                }
-                for r in ranked
-            ],
-            "disclaimer": DISCLAIMER,
-        }
-        out_dir = out_root / "高频题"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out = out_dir / "近30天高频题Top50.md"
-        out.write_text(env.get_template("top.md.j2").render(**ctx), encoding="utf-8")
-        written.append(out)
-
-    logger.info("渲染完成:%d 个文件", len(written))
-    return written
-
+def md(value) -> str:
+    return re.sub(r"([\\`*_{}\[\]<>|])",r"\\\1",str(value or "").replace("\n"," ").replace("\r"," "))
 
 def _group_company_round(rows) -> list[dict]:
-    """按 公司 → 轮次 两级分组,并预构建每轮次的 Markdown 文本块。"""
-    by_company: dict[str, dict] = defaultdict(
-        lambda: {"company": "", "rounds": defaultdict(list)}
-    )
-    for r in rows:
-        company = r["company"] or "未知公司"
-        by_company[company]["company"] = company
-        round_name = r["round_name"] or "未标注轮次"
-        follow_ups = _load_follow_ups(r["follow_ups"])
-        by_company[company]["rounds"][round_name].append(
-            {
-                "question": r["question"],
-                "q_type": r["q_type"],
-                "follow_ups": follow_ups,
-                "date": (r["round_date"] or (r["last_seen"] or ""))[:10],
-                "source_url": r["source_url"],
-                "post_title": r["post_title"],
-            }
-        )
-    result = []
-    for company in sorted(by_company):
-        rounds = by_company[company]["rounds"]
-        result.append(
-            {
-                "company": company,
-                "rounds": [
-                    {
-                        "round_name": name,
-                        "questions": rounds[name],
-                        "block": _render_round_block(rounds[name]),
-                    }
-                    for name in sorted(rounds)
-                ],
-            }
-        )
-    return result
+    groups = defaultdict(lambda:defaultdict(list))
+    for row in rows:
+        date_label = "面试日期" if row["round_date"] else "发布日期（面试日期未知）"
+        lines = [f"- **{md(row['question'])}** `{md(row['q_type'])}`",
+                 f"  - {date_label}：{row['event_date']}"]
+        for follow in json.loads(row["follow_ups"]):
+            lines.append(f"  - 追问：{md(follow)}")
+        lines.append(f"  - 来源：[{md(row['post_title'])}]({row['source_url']})")
+        groups[row["company"] or "未知公司"][row["round_name"] or "未标注轮次"].append("\n".join(lines))
+    return [{"company":company,"rounds":[{"round_name":name,"block":"\n".join(items)} for name,items in sorted(rounds.items())]} for company,rounds in sorted(groups.items())]
 
+def rank_questions(rows, cfg: AppConfig, today: date | None = None) -> list[dict]:
+    today = today or now().date()
+    since = today-timedelta(days=cfg.output.recency_days-1)
+    groups = defaultdict(dict)
+    for row in rows:
+        day = date.fromisoformat(row["event_date"])
+        if not since<=day<=today:
+            continue
+        # One source URL contributes once, even across versions/rounds.
+        old = groups[row["hash"]].get(row["source_url"])
+        if old is None or row["event_date"]>old["event_date"]:
+            groups[row["hash"]][row["source_url"]] = row
+    ranked = []
+    for h,posts in groups.items():
+        if len(posts)<cfg.output.high_frequency_min_posts:
+            continue
+        values = list(posts.values())
+        first = values[0]
+        ranked.append({"hash":h,"question":first["question"],"q_type":first["q_type"],
+            "companies":"、".join(sorted({r["company"] or "未知公司" for r in values})),
+            "position_category":"、".join(sorted({CATEGORY_DIRS.get(r["position_category"],"其他") for r in values})),
+            "times_seen":len(posts),"last_seen":max(r["event_date"] for r in values),
+            "score":sum(2**(-((today-date.fromisoformat(r["event_date"])).days)/cfg.output.half_life_days) for r in values),
+            "sources":[{"url":url,"title":r["post_title"]} for url,r in sorted(posts.items())]})
+    ranked.sort(key=lambda r:(-r["score"],-r["times_seen"],r["hash"]))
+    return ranked[:cfg.output.top_limit]
 
-def _render_round_block(questions: list[dict]) -> str:
-    """把一轮的题目渲染成嵌套列表文本(追问链缩进一层)。"""
-    lines: list[str] = []
-    for q in questions:
-        head = f"- **{q['question']}**"
-        if q["q_type"]:
-            head += f" `{q['q_type']}`"
-        lines.append(head)
-        if q["date"]:
-            lines.append(f"  - 日期:{q['date']}")
-        for fu in q["follow_ups"]:
-            lines.append(f"  - 追问:{fu}")
-        lines.append(f"  - 来源:[{q['post_title']}]({q['source_url']})")
-    return "\n".join(lines) if lines else "- (无题目记录)"
+def _write(path: Path, content: str):
+    path.parent.mkdir(parents=True,exist_ok=True)
+    temp = path.with_suffix(path.suffix+".tmp")
+    temp.write_text(content,encoding="utf-8")
+    os.replace(temp,path)
 
+def render_all(cfg: AppConfig,store) -> list[Path]:
+    env = Environment(loader=FileSystemLoader(cfg.resolve(cfg.output.template_dir)),undefined=StrictUndefined,autoescape=False)
+    env.filters["md"] = md
+    rows = store.questions_for_render()
+    month_groups = defaultdict(list)
+    for row in rows:
+        if row["event_date"] <= now().date().isoformat():
+            month_groups[(row["position_category"],row["event_date"][:7])].append(row)
+    current = now().strftime("%Y-%m")
+    # Always overwrite current empty outputs, so old stale content never masquerades as new results.
+    for category in ("java_backend","agent_ai"):
+        month_groups.setdefault((category,current),[])
+    root = cfg.resolve(cfg.output.output_dir)
+    # Regenerate previously generated month files as empty if all their records
+    # were removed by review/re-extraction; never leave invalidated counts behind.
+    for category,dirname in CATEGORY_DIRS.items():
+        for path in (root/dirname).glob("????-??.md"):
+            if re.fullmatch(r"\d{4}-\d{2}",path.stem):
+                month_groups.setdefault((category,path.stem),[])
+    written = []
+    for (category,month),items in sorted(month_groups.items()):
+        dirname = CATEGORY_DIRS.get(category,"其他")
+        path = root/dirname/f"{month}.md"
+        _write(path,env.get_template("monthly.md.j2").render(title=f"{dirname} 面经汇总（{month}）",generated_at=now().isoformat(timespec="seconds"),count=len(items),companies=sorted({r["company"] or "未知公司" for r in items}),groups=_group_company_round(items),disclaimer=DISCLAIMER))
+        written.append(path)
+    path = root/"高频题"/"近30天高频题Top50.md"
+    _write(path,env.get_template("top.md.j2").render(title=f"近{cfg.output.recency_days}天高频题 Top{cfg.output.top_limit}",items=rank_questions(rows,cfg),generated_at=now().isoformat(timespec="seconds"),disclaimer=DISCLAIMER,min_posts=cfg.output.high_frequency_min_posts,half_life=cfg.output.half_life_days))
+    written.append(path)
+    return written
 
-def _load_follow_ups(raw: str | None) -> list[str]:
-    if not raw:
-        return []
-    try:
-        data = json.loads(raw)
-        return data if isinstance(data, list) else []
-    except ValueError:
-        return []
-
-
-def main(config_path: str | None = None) -> int:
-    """独立入口:python -m pipeline.render"""
-    import argparse
-
-    from .config import load_config, setup_logging
-
-    parser = argparse.ArgumentParser(description="渲染 Markdown 输出")
-    parser.add_argument("--config", default=None)
-    parser.add_argument("--verbose", action="store_true")
-    args = parser.parse_args()
-
-    cfg = load_config(config_path or args.config)
-    setup_logging(cfg.resolve(cfg.output.log_dir), args.verbose)
-    store = Store(cfg.resolve(cfg.output.db_path))
-    store.bind_raw_root(cfg.resolve(cfg.output.raw_dir))
-    for path in render_all(cfg, store):
-        logger.info("已生成: %s", path)
-    return 0
-
+def main() -> int:
+    import sys
+    from .__main__ import main as cli
+    return cli(["render",*sys.argv[1:]])
 
 if __name__ == "__main__":
     raise SystemExit(main())
