@@ -383,14 +383,23 @@ def collect_incremental(cfg: AppConfig, days: int | None = None, sources: list[s
                 if store.collected_today(source) >= cfg.sources[source].max_posts:
                     source_stats["status"] = "source_limit_reached"
                     continue
-                candidates = collector.discover()
-                discovery_completed = True
-                discovery_stats = getattr(collector,"discovery_stats",{})
-                source_stats.update(discovery_stats)
-                source_stats["unique_candidates"] = max(discovery_stats.get("unique_candidates",0),len(candidates))
-                source_stats["candidates_returned"] = len(candidates)
-                store.remember_candidates(source,candidates)
+                # Drain the persisted Nowcoder queue before opening more discovery
+                # pages. This reserves the request budget for article review and
+                # lets a backlog make progress even when the listing is noisy.
                 retries = store.retry_candidates(source,cfg.collect.page_attempts_per_day,cfg.collect.max_candidates_per_source)
+                defer_discovery = source == "nowcoder" and bool(retries)
+                if defer_discovery:
+                    candidates = retries
+                    source_stats["discovery_deferred"] = True
+                else:
+                    candidates = collector.discover()
+                    discovery_completed = True
+                    discovery_stats = getattr(collector,"discovery_stats",{})
+                    source_stats.update(discovery_stats)
+                    source_stats["unique_candidates"] = max(discovery_stats.get("unique_candidates",0),len(candidates))
+                    source_stats["candidates_returned"] = len(candidates)
+                    store.remember_candidates(source,candidates)
+                    retries = store.retry_candidates(source,cfg.collect.page_attempts_per_day,cfg.collect.max_candidates_per_source)
                 candidates = retries if source == "nowcoder" else list(dict.fromkeys(retries+candidates))[:cfg.collect.max_candidates_per_source]
                 source_stats["retry_candidates"] = len(retries)
                 source_stats["queued_candidates"] = len(candidates)

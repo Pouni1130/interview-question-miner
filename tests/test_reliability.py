@@ -18,7 +18,7 @@ def test_source_request_cap_override_and_default(cfg):
     nowcoder = PublicCollector(cfg, 'nowcoder')
     csdn = PublicCollector(cfg, 'csdn')
     try:
-        assert nowcoder.http.max_requests == 80
+        assert nowcoder.http.max_requests == 320
         assert csdn.http.max_requests == cfg.collect.max_requests_per_source == 40
         nowcoder.http.max_requests = 2
         with patch.object(nowcoder.http.session, 'get', return_value=response('ok')) as get, patch('pipeline.http.time.sleep'):
@@ -57,6 +57,20 @@ def test_unprocessed_discovery_survives_next_run(cfg, store):
     assert second['sources']['nowcoder']['unprocessed_candidates'] == 0
 
 
+def test_nowcoder_queue_is_drained_before_discovery(cfg, store):
+    url = 'https://www.nowcoder.com/discuss/queued-first'
+    post = RawPost(url, 'queued-first', 'Java面经', '', TODAY, now().isoformat(),
+                   'Java 面试 Redis 如何持久化？' * 3)
+    store.remember_candidates('nowcoder', [url])
+    with patch.object(PublicCollector, 'discover', side_effect=AssertionError('discovery must be deferred')), \
+         patch.object(PublicCollector, 'fetch', return_value=post) as fetch:
+        metrics = {}
+        assert collect_incremental(cfg, sources=['nowcoder'], metrics=metrics) == 1
+    fetch.assert_called_once_with(url)
+    assert metrics['sources']['nowcoder']['discovery_deferred'] is True
+    assert metrics['sources']['nowcoder']['candidate_queue_after']['pending'] == 0
+
+
 def test_discovered_candidate_survives_interruption(cfg, store):
     urls = ['https://www.nowcoder.com/discuss/1', 'https://www.nowcoder.com/discuss/2']
     post = RawPost(urls[1], '2', 'Java面经', '', TODAY, now().isoformat(),
@@ -87,16 +101,18 @@ def test_discovery_page_and_candidates_resume_after_request_cap(cfg, store):
                 '<li class="active"><a href="/?page=1">1</a></li>'
                 '<li><a href="/?page=2">2</a></li></ul>')
 
-    def capped_get(_http, url):
-        if url == cfg.sources['nowcoder'].discovery_urls[0]:
-            return response(page_one, url=url)
-        raise RequestLimitReached('local cap')
+    store.remember_candidates('nowcoder', [first])
+    store.save_discovery_page('nowcoder', cfg.sources['nowcoder'].discovery_urls[0], [], [next_page])
 
-    with patch.object(PublicHTTP, 'get', autospec=True, side_effect=capped_get):
+    def fetched(_collector, url):
+        return RawPost(url, url.rsplit('/', 1)[-1], 'Java面经', '', TODAY,
+                       now().isoformat(), 'Java 面试 Redis 如何持久化？' * 3)
+
+    with patch.object(PublicCollector, 'discover', side_effect=AssertionError('queued work goes first')), \
+         patch.object(PublicCollector, 'fetch', autospec=True, side_effect=fetched):
         metrics = {}
-        assert collect_incremental(cfg, sources=['nowcoder'], metrics=metrics) == 0
-    assert metrics['sources']['nowcoder']['status'] == 'request_limit_reached'
-    assert store.retry_candidates('nowcoder', 3, 80) == [first]
+        assert collect_incremental(cfg, sources=['nowcoder'], metrics=metrics) == 1
+    assert metrics['sources']['nowcoder']['discovery_deferred'] is True
     assert store.pending_discovery_pages('nowcoder') == [next_page]
 
     def resumed_get(_http, url):
@@ -104,16 +120,12 @@ def test_discovery_page_and_candidates_resume_after_request_cap(cfg, store):
             return response('<a href="/discuss/2">Java 面经</a>', url=url)
         return response('<h1>empty public list</h1>', url=url)
 
-    def fetched(_collector, url):
-        return RawPost(url, url.rsplit('/', 1)[-1], 'Java面经', '', TODAY,
-                       now().isoformat(), 'Java 面试 Redis 如何持久化？' * 3)
-
     with patch.object(PublicHTTP, 'get', autospec=True, side_effect=resumed_get), \
          patch.object(PublicCollector, 'fetch', autospec=True, side_effect=fetched) as fetch, \
          patch('pipeline.collect.time.sleep'):
         metrics = {}
-        assert collect_incremental(cfg, sources=['nowcoder'], metrics=metrics) == 2
-    assert {call.args[1] for call in fetch.call_args_list} == {first, second}
+        assert collect_incremental(cfg, sources=['nowcoder'], metrics=metrics) == 1
+    assert {call.args[1] for call in fetch.call_args_list} == {second}
     assert store.pending_discovery_pages('nowcoder') == []
     assert metrics['sources']['nowcoder']['candidate_queue_after']['pending'] == 0
 

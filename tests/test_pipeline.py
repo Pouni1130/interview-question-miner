@@ -31,6 +31,9 @@ def cfg(tmp_path,monkeypatch):
     cfg.output.template_dir = str(ROOT/"templates")
     cfg.llm.api_key = "offline-test"
     cfg.llm.retry_backoff = 0
+    # Reliability tests cover the three-attempt queue behavior explicitly;
+    # production config uses one page attempt per day to avoid same-run churn.
+    cfg.collect.page_attempts_per_day = 3
     return cfg
 
 @pytest.fixture

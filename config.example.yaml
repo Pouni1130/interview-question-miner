@@ -14,6 +14,8 @@ collect:
   daily_limit: 200
   # 近 N 个自然日（含今天）；命令行 --days 可覆盖。
   days: 60
+  # 正文缺失页面每天只复查一次，次日继续；网络错误仍按 max_retries 有限重试。
+  page_attempts_per_day: 1
   max_requests_per_source: 40
   max_candidates_per_source: 80
   # 掘金最新分片站点地图约 8 MB；只读一个分片，最多取候选上限内的文章。
@@ -22,8 +24,6 @@ collect:
   # 失败重试次数(指数退避)
   max_retries: 3
   retry_backoff: 5
-  # 正文暂缺/不完整时，每帖每天最多复查次数；间隔仍受至少 5 秒请求间隔限制。
-  page_attempts_per_day: 3
   page_retry_cooldown: 30
   user_agent: "MianjingPipeline/0.2 (personal study; respects robots.txt)"
 
@@ -34,7 +34,7 @@ sources:
   nowcoder:
     enabled: true
     # 单次运行的牛客 HTTP 请求上限；其他来源仍使用 collect.max_requests_per_source。
-    max_requests_per_run: 80
+    max_requests_per_run: 320
     hosts: [www.nowcoder.com]
     discovery_urls: ["https://www.nowcoder.com/discuss"]
     seed_urls: []
