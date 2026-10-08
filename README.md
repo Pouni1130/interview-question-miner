@@ -126,9 +126,9 @@ python -m pipeline review --review-file "output/pending/<fingerprint>.json"
 
 牛客发现器会跟进公开 HTML 的下一页链接，默认每轮最多 3 页（含入口页），仍受牛客每轮 320 次 HTTP 总请求上限约束。空壳列表页冷却后最多复查一次。`max_discovery_pages` 是上限；持续空页面、访问限制或没有下一页时会提前停止，并记录停止原因。近 60 天是收录时间窗，不保证推荐列表覆盖全部 60 天帖子。
 
-正文暂缺、过短或缺少可靠发帖时间的文章进入 `retryable` 队列。本机 `collect.page_attempts_per_day: 1`，每帖每天只复查一次，次日继续；`page_retry_cooldown: 30` 仍控制同次运行内的发现页复查。队列与次数保存在 SQLite，重启不会重置当天次数。牛客有待处理队列时优先处理队列，队列清空后的下一轮才继续发现新页面。每次抓取的网络 5xx 重试仍受总 HTTP 请求上限约束。成功、付费、robots 禁止等情况按各自原因处理。
+正文暂缺、过短或缺少可靠发帖时间的文章进入 `retryable` 队列。本机 `collect.page_attempts_per_day: 1`，每帖每天只复查一次，次日继续；`page_retry_cooldown: 30` 仍控制同次运行内的发现页复查。队列与次数保存在 SQLite，重启不会重置当天次数。牛客优先处理队列中尚未尝试的候选；仅剩失败重试项时允许继续发现新页面，避免一个长期解析失败的帖子阻塞每日新帖发现。每轮候选先安排未尝试项，再按上次尝试时间由早到晚安排到期重试，仍受候选数量和 HTTP 请求总上限约束。成功、付费、robots 禁止等情况按各自原因处理。
 
-牛客原帖日期读取 URL 对应的 `prefetchData[*].contentId` 和 `ssrCommonData.contentData.id/uuid` 记录中的 `createdAt/createTime`，不采用评论、推荐帖、编辑时间或面试发生时间。旧牛客记录升级后会排入日期复查队列，未复查前不进入抽取和输出，历史 raw 与抽取内容保留。
+牛客原帖日期读取 URL 对应的 `prefetchData[*].contentId` 和 `ssrCommonData.contentData.id/uuid` 记录中的 `createdAt/createTime`，不采用评论、推荐帖、编辑时间或面试发生时间。旧牛客记录升级后会排入日期复查队列，未复查前不进入抽取和输出，历史 raw 与抽取内容保留。已有历史记录的日期复核不受新帖采集时间窗下限限制：日期确认不变时恢复原抽取结果，日期纠正时保留旧快照并将新快照交给正常抽取流程；未来日期仍不收录。
 
 原帖唯一指纹为 URL + 发布时间。正文保存在 `raw/{source}/{采集日期}/{post_id}.json`，同一记录永不覆盖；同一日的不同发布时间版本使用指纹后缀。
 

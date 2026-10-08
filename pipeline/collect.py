@@ -383,11 +383,11 @@ def collect_incremental(cfg: AppConfig, days: int | None = None, sources: list[s
                 if store.collected_today(source) >= cfg.sources[source].max_posts:
                     source_stats["status"] = "source_limit_reached"
                     continue
-                # Drain the persisted Nowcoder queue before opening more discovery
-                # pages. This reserves the request budget for article review and
-                # lets a backlog make progress even when the listing is noisy.
+                # Drain never-attempted candidates before opening more discovery
+                # pages. Failed retries alone must not suppress new discovery on
+                # every daily run; new candidates also take priority in the batch.
                 retries = store.retry_candidates(source,cfg.collect.page_attempts_per_day,cfg.collect.max_candidates_per_source)
-                defer_discovery = source == "nowcoder" and bool(retries)
+                defer_discovery = source == "nowcoder" and store.has_unattempted_candidates(source)
                 if defer_discovery:
                     candidates = retries
                     source_stats["discovery_deferred"] = True
@@ -438,7 +438,11 @@ def collect_incremental(cfg: AppConfig, days: int | None = None, sources: list[s
                             source_stats["retry_pending"] += 1
                             continue
                         day = datetime.fromisoformat(post.publish_time.replace("Z","+00:00")).date()
-                        if not since <= day <= now().date():
+                        historical_recheck = source == "nowcoder" and store.needs_publication_recheck(post.url)
+                        # The collection window limits new posts, not verification
+                        # of retained history. Corrected dates get a new immutable
+                        # snapshot and normal extraction; future dates stay invalid.
+                        if day > window_end or (day < since and not historical_recheck):
                             store.record_fetch(url,source,"skipped","outside_time_window")
                             source_stats["outside_time_window"] += 1
                             continue

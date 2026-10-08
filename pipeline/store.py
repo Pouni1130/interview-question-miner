@@ -169,6 +169,11 @@ class Store:
             return self.conn.execute("SELECT 1 FROM posts WHERE url=?", (url,)).fetchone() is not None
         return self.conn.execute("SELECT 1 FROM posts WHERE fingerprint=?", (fingerprint(url,publish_time),)).fetchone() is not None
 
+    def needs_publication_recheck(self, url: str) -> bool:
+        return self.conn.execute("""SELECT 1 FROM posts p WHERE p.url=? AND p.publication_verified=0
+            AND NOT EXISTS(SELECT 1 FROM posts verified WHERE verified.url=p.url
+                AND verified.publication_verified=1) LIMIT 1""", (url,)).fetchone() is not None
+
     def upsert_post(self, post, status: str = "raw", raw_path: Path | None = None, publication_verified: bool = True) -> str:
         fp = fingerprint(post.url, post.publish_time or "")
         with self.conn:
@@ -299,6 +304,11 @@ class Store:
             WHERE source=? AND status='pending'""",(source,)).fetchone()[0]
         return counts
 
+    def has_unattempted_candidates(self, source: str) -> bool:
+        return self.conn.execute("""SELECT 1 FROM candidate_queue q
+            LEFT JOIN fetch_attempts a ON a.url=q.url WHERE q.source=? AND q.status='pending'
+            AND (a.url IS NULL OR a.outcome='discovered') LIMIT 1""", (source,)).fetchone() is not None
+
     def retry_candidates(self, source: str, max_attempts: int, limit: int) -> list[str]:
         if source == "nowcoder":
             return [r[0] for r in self.conn.execute("""SELECT q.url FROM candidate_queue q
@@ -307,7 +317,8 @@ class Store:
                   (a.outcome IN ('failed','source_unavailable') AND substr(a.attempted_at,1,10)<>?) OR
                   (a.outcome='retryable' AND (substr(a.attempted_at,1,10)<>? OR
                     (a.attempt_count<? AND (a.next_retry_at IS NULL OR a.next_retry_at<=?)))))
-                ORDER BY q.first_seen_at,q.priority DESC,q.url LIMIT ?""",
+                ORDER BY CASE WHEN a.url IS NULL OR a.outcome='discovered' THEN 0 ELSE 1 END,
+                    COALESCE(a.attempted_at,q.first_seen_at),q.priority DESC,q.url LIMIT ?""",
                 (source,now().date().isoformat(),now().date().isoformat(),max_attempts,now().isoformat(),limit))]
         return [r[0] for r in self.conn.execute("""SELECT url FROM fetch_attempts WHERE source=? AND
             (outcome='discovered' OR (outcome='retryable' AND
